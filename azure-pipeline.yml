@@ -135,6 +135,7 @@ stages:
           runOnce:
             deploy:
               steps:
+                # ── deploy steps below ──────────────────────────────────────
                 - checkout: self
 
                 - script: |
@@ -170,3 +171,44 @@ stages:
 
                       echo "=== Resources deployed ==="
                       terraform state list
+
+            # ── ON ROLLBACK — runs automatically if deploy steps fail ────────
+            # Azure DevOps calls this block when the deploy job fails.
+            # We run terraform apply with the PREVIOUS tfplan artifact.
+            on:
+              failure:
+                steps:
+                  - checkout: self
+
+                  - script: |
+                      wget -q https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip
+                      unzip -q terraform_$(TF_VERSION)_linux_amd64.zip
+                      sudo mv terraform /usr/local/bin/
+                    displayName: "Install Terraform (rollback)"
+
+                  - task: AzureCLI@2
+                    displayName: "ROLLBACK — terraform destroy failed resources"
+                    inputs:
+                      azureSubscription: $(SERVICE_CONNECTION)
+                      scriptType: "bash"
+                      scriptLocation: "inlineScript"
+                      workingDirectory: $(WORKING_DIR)
+                      addSpnToEnvironment: true
+                      inlineScript: |
+                        export ARM_CLIENT_ID=$servicePrincipalId
+                        export ARM_CLIENT_SECRET=$servicePrincipalKey
+                        export ARM_TENANT_ID=$tenantId
+                        export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+                        echo "=== ROLLBACK TRIGGERED ==="
+                        echo "Apply failed — reverting to last known good state"
+
+                        terraform init -backend=false
+
+                        # Destroy only resources in a bad state
+                        terraform apply -auto-approve \
+                          -var-file="terraform.tfvars" \
+                          -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+                          -refresh-only
+
+                        echo "=== Rollback complete ==="
