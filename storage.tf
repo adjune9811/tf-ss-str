@@ -1,11 +1,19 @@
-# This file is a reference pointer.
-# The actual Terraform configuration lives in: terraform/storage/
-#
-# To deploy via Azure DevOps:
-#   Pipeline: pipelines/deploy-storage.yml
-#
-# To deploy locally:
-#   cd terraform/storage
-#   terraform init
-#   terraform plan -var="environment=dev"
-#   terraform apply -var="environment=dev"
+resource "azurerm_storage_account" "TF-storage" {
+  count                    = var.storage_account_count
+  name                     = "addtfstr123${count.index}"
+  resource_group_name      = var.resource_group_name
+  location                 = var.resource_group_location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+
+  tags = {
+    environment = "staging"
+  }
+}
+
+resource "azurerm_storage_container" "tf-ss-container" {
+  count                 = var.storage_account_count
+  name                  = "tf-container${count.index}"
+  storage_account_name  = azurerm_storage_account.TF-storage[count.index].name
+  container_access_type = "private"
+}

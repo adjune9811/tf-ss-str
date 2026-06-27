@@ -1,0 +1,204 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Azure Pipeline — Deploy Terraform Storage
+# Deploys: azurerm_storage_account (count) + azurerm_storage_container (count)
+#
+# Prerequisites in Azure DevOps before running:
+#   1. Service Connection named "azure-service-connection"
+#      Project Settings → Service Connections → New → Azure Resource Manager
+#   2. Pipeline variable TF_VAR_subscription_id set as SECRET
+#      Pipeline → Edit → Variables → add TF_VAR_subscription_id
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - "*.tf"                # run when any .tf file changes
+      - terraform.tfvars
+      - azure-pipeline.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - "*.tf"
+      - terraform.tfvars
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  TF_VERSION: "1.7.5"
+  WORKING_DIR: "$(System.DefaultWorkingDirectory)"  # .tf files are at repo root
+  SERVICE_CONNECTION: "azure-service-connection"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — VALIDATE
+# Checks formatting and syntax. No Azure connection needed. Runs on every push.
+# ══════════════════════════════════════════════════════════════════════════════
+stages:
+  - stage: Validate
+    displayName: "Validate"
+
+    jobs:
+      - job: TerraformValidate
+        displayName: "terraform fmt + validate"
+
+        steps:
+          - checkout: self
+            displayName: "Checkout repo"
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform $(TF_VERSION)"
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          # terraform fmt -check: fails if files are not properly formatted
+          - script: |
+              echo "=== Checking Terraform formatting ==="
+              terraform fmt -check -diff
+            workingDirectory: $(WORKING_DIR)
+            displayName: "terraform fmt -check"
+
+          # Init without backend — just downloads the azurerm provider
+          - script: |
+              echo "=== Initializing providers ==="
+              terraform init -backend=false
+            workingDirectory: $(WORKING_DIR)
+            displayName: "terraform init (no backend)"
+
+          # Validate syntax and internal consistency
+          - script: |
+              echo "=== Validating configuration ==="
+              terraform validate
+            workingDirectory: $(WORKING_DIR)
+            displayName: "terraform validate"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — PLAN
+# Connects to Azure and shows what will be created/changed/destroyed.
+# Runs only on pushes to main (not PRs).
+# ══════════════════════════════════════════════════════════════════════════════
+  - stage: Plan
+    displayName: "Plan"
+    dependsOn: Validate
+    condition: |
+      and(
+        succeeded('Validate'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+
+    jobs:
+      - job: TerraformPlan
+        displayName: "terraform plan"
+
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          # Full init — connects to Azure to read current state
+          # ARM_* vars come automatically from the service connection
+          - task: TerraformTaskV4@4
+            displayName: "terraform init"
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              workingDirectory: $(WORKING_DIR)
+              backendType: "local"    # using local state for now
+            env:
+              ARM_USE_OIDC: "false"
+
+          # terraform plan using your tfvars file
+          # subscription_id is passed as TF_VAR_subscription_id pipeline secret
+          # (so it is not hardcoded in tfvars that go into source control)
+          - task: TerraformTaskV4@4
+            displayName: "terraform plan"
+            inputs:
+              provider: "azurerm"
+              command: "plan"
+              workingDirectory: $(WORKING_DIR)
+              environmentServiceNameAzureRM: $(SERVICE_CONNECTION)
+              commandOptions: >-
+                -var-file="terraform.tfvars"
+                -var="subscription_id=$(TF_VAR_subscription_id)"
+                -out="$(WORKING_DIR)/tfplan"
+
+          # Print the plan in human-readable form
+          - script: |
+              terraform show -no-color tfplan
+            workingDirectory: $(WORKING_DIR)
+            displayName: "Show plan output"
+
+          # Save the plan file so the Apply stage can use it
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish plan artifact"
+            inputs:
+              pathToPublish: "$(WORKING_DIR)/tfplan"
+              artifactName: "tfplan"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — APPLY
+# Applies exactly what was planned in Stage 2.
+# Uses a deployment job so it shows in Azure DevOps Environments.
+# Add a manual approval gate in: Pipelines → Environments → tf-storage → Approvals
+# ══════════════════════════════════════════════════════════════════════════════
+  - stage: Apply
+    displayName: "Apply"
+    dependsOn: Plan
+    condition: succeeded('Plan')
+
+    jobs:
+      - deployment: TerraformApply
+        displayName: "terraform apply"
+        environment: "tf-storage"   # create this in Pipelines → Environments
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - task: DownloadBuildArtifacts@1
+                  displayName: "Download plan artifact"
+                  inputs:
+                    artifactName: "tfplan"
+                    downloadPath: "$(WORKING_DIR)"
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform init"
+                  inputs:
+                    provider: "azurerm"
+                    command: "init"
+                    workingDirectory: $(WORKING_DIR)
+                    backendType: "local"
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform apply"
+                  inputs:
+                    provider: "azurerm"
+                    command: "apply"
+                    workingDirectory: $(WORKING_DIR)
+                    environmentServiceNameAzureRM: $(SERVICE_CONNECTION)
+                    commandOptions: "-auto-approve $(WORKING_DIR)/tfplan/tfplan"
+
+                # Show what was created
+                - script: |
+                    echo "=== Resources deployed ==="
+                    terraform output || echo "No outputs defined"
+                    echo ""
+                    echo "Storage accounts created:"
+                    terraform state list | grep storage_account
+                  workingDirectory: $(WORKING_DIR)
+                  displayName: "Show deployed resources"
+                  continueOnError: true

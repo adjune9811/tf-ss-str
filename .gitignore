@@ -1,18 +1,18 @@
-# Terraform
-.terraform/
-.terraform.lock.hcl
-*.tfplan
-tfplan
+# Terraform state — contains secrets, never commit
 *.tfstate
 *.tfstate.backup
-terraform.tfvars
-override.tf
-override.tf.json
+
+# Terraform working directory
+.terraform/
+.terraform.lock.hcl
+
+# Plan files
+tfplan
+*.tfplan
+
+# Var files with secrets (keep terraform.tfvars only if it has no real secrets)
+*.auto.tfvars
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Editor
-.vscode/
-*.swp
