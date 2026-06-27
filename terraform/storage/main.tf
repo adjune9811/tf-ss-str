@@ -8,7 +8,6 @@ terraform {
     }
   }
 
-  # Remote state — stored in Azure Blob so the pipeline and local machine share the same state
   backend "azurerm" {
     resource_group_name  = "rg-terraform-state"
     storage_account_name = "stterraformstate001"
@@ -19,8 +18,6 @@ terraform {
 
 provider "azurerm" {
   features {}
-  # ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_SUBSCRIPTION_ID, ARM_TENANT_ID
-  # are injected by the Azure DevOps service connection automatically
 }
 
 # ─── Resource Group ───────────────────────────────────────────────────────────
@@ -30,66 +27,71 @@ resource "azurerm_resource_group" "storage" {
   tags     = local.tags
 }
 
-# ─── Storage Account ──────────────────────────────────────────────────────────
+# ─── Storage Accounts (count) ─────────────────────────────────────────────────
+# CONCEPT: count meta-argument
+# Creates N copies of this resource — one per index (0, 1, 2 ...).
+# To add a storage account:  set storage_account_count = 3  in tfvars → terraform apply
+# To remove one:             set storage_account_count = 1  in tfvars → terraform apply
+#
+# IMPORTANT: count uses index-based addressing:
+#   azurerm_storage_account.main[0]  → first account
+#   azurerm_storage_account.main[1]  → second account
+#
+# WARNING: if you remove from the MIDDLE (e.g. index 1 of 3), Terraform
+# re-indexes — index 2 becomes index 1 and is REPLACED, not kept.
+# Use for_each with a map if order stability matters more than simplicity.
 resource "azurerm_storage_account" "main" {
-  name                = local.storage_account_name
+  count = var.storage_account_count
+
+  # Each account gets a unique name: prefix + index (e.g. stdevdemodev0, stdevdemodev1)
+  name                = "${local.storage_name_prefix}${count.index}"
   resource_group_name = azurerm_resource_group.storage.name
   location            = azurerm_resource_group.storage.location
 
-  account_tier             = var.account_tier             # Standard or Premium
-  account_replication_type = var.replication_type         # LRS, GRS, RAGRS, ZRS
+  account_tier             = var.account_tier
+  account_replication_type = var.replication_type
 
-  # Security: disable public blob access — blobs are private by default
-  allow_nested_items_to_be_public  = false
+  allow_nested_items_to_be_public = false
+  https_traffic_only_enabled      = true
+  min_tls_version                 = "TLS1_2"
 
-  # Security: require HTTPS for all requests
-  enable_https_traffic_only = true
-
-  # Security: require TLS 1.2 minimum
-  min_tls_version = "TLS1_2"
-
-  # Enable blob versioning — keeps previous versions of overwritten blobs
   blob_properties {
     versioning_enabled = var.enable_versioning
 
-    # Soft delete: deleted blobs are recoverable for N days
     delete_retention_policy {
       days = var.soft_delete_days
     }
 
-    # Soft delete for containers too
     container_delete_retention_policy {
       days = var.soft_delete_days
     }
   }
 
-  # Lifecycle: automatically move old blobs to cheaper storage tiers
-  # (only works with Standard LRS/GRS, not Premium)
   lifecycle {
-    ignore_changes = [
-      # Azure may update tags internally — ignore to avoid spurious diffs
-      tags["ms-resource-usage"]
-    ]
+    ignore_changes = [tags["ms-resource-usage"]]
   }
 
-  tags = local.tags
+  tags = merge(local.tags, {
+    # Tag each account with its index so you can identify it easily in the portal
+    AccountIndex = tostring(count.index)
+  })
 }
 
 # ─── Lifecycle Management Policy ─────────────────────────────────────────────
-# Automatically tier blobs to save cost:
-#   0–30 days   → Hot (frequent access, higher cost)
-#   30–90 days  → Cool (infrequent access, lower cost)
-#   90+ days    → Archive (rare access, cheapest)
+# count here mirrors the storage account count — one policy per account.
+# count.index is used to reference the matching storage account.
 resource "azurerm_storage_management_policy" "lifecycle" {
-  storage_account_id = azurerm_storage_account.main.id
+  count = var.storage_account_count
+
+  # [count.index] links this policy to its storage account
+  storage_account_id = azurerm_storage_account.main[count.index].id
 
   rule {
-    name    = "tier-to-cool-then-archive"
+    name    = "tier-and-expire"
     enabled = true
 
     filters {
       blob_types = ["blockBlob"]
-      # Apply to all containers — or specify: prefix_match = ["logs/", "backups/"]
     }
 
     actions {
@@ -99,7 +101,6 @@ resource "azurerm_storage_management_policy" "lifecycle" {
         delete_after_days_since_modification_greater_than          = var.blob_delete_after_days
       }
 
-      # Also apply to snapshots
       snapshot {
         delete_after_days_since_creation_greater_than = var.soft_delete_days
       }
@@ -108,11 +109,22 @@ resource "azurerm_storage_management_policy" "lifecycle" {
 }
 
 # ─── Storage Containers ───────────────────────────────────────────────────────
-# Create one container for each name in var.containers
+# CONCEPT: count + for_each combination
+# We need containers inside EACH storage account.
+# Problem: can't nest count inside for_each.
+# Solution: flatten into a single map keyed by "accountIndex-containerName".
+#
+# Example with count=2, containers=["uploads","logs"]:
+#   local.container_map = {
+#     "0-uploads" = { account_index = 0, container_name = "uploads" }
+#     "0-logs"    = { account_index = 0, container_name = "logs"    }
+#     "1-uploads" = { account_index = 1, container_name = "uploads" }
+#     "1-logs"    = { account_index = 1, container_name = "logs"    }
+#   }
 resource "azurerm_storage_container" "containers" {
-  for_each = toset(var.containers)
+  for_each = local.container_map
 
-  name                  = each.value
-  storage_account_name  = azurerm_storage_account.main.name
-  container_access_type = "private"   # never "blob" or "container" — keeps data private
+  name                  = each.value.container_name
+  storage_account_id    = azurerm_storage_account.main[each.value.account_index].id
+  container_access_type = "private"
 }

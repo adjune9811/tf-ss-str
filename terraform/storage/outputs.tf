@@ -1,27 +1,33 @@
-output "storage_account_name" {
-  description = "Name of the created storage account"
-  value       = azurerm_storage_account.main.name
+output "storage_account_names" {
+  description = "Names of all created storage accounts (one per count index)"
+  value       = [for sa in azurerm_storage_account.main : sa.name]
 }
 
-output "storage_account_id" {
-  description = "Resource ID of the storage account"
-  value       = azurerm_storage_account.main.id
+output "storage_account_ids" {
+  description = "Resource IDs of all storage accounts"
+  value       = [for sa in azurerm_storage_account.main : sa.id]
 }
 
-output "primary_blob_endpoint" {
-  description = "Blob service endpoint — use this URL to access blobs"
-  value       = azurerm_storage_account.main.primary_blob_endpoint
+output "primary_blob_endpoints" {
+  description = "Blob endpoints for each storage account"
+  value       = [for sa in azurerm_storage_account.main : sa.primary_blob_endpoint]
 }
 
-output "primary_connection_string" {
-  description = "Connection string for apps to connect to this storage account"
-  value       = azurerm_storage_account.main.primary_connection_string
-  sensitive   = true   # marked sensitive — won't print in pipeline logs
+output "primary_connection_strings" {
+  description = "Connection strings for each storage account (sensitive)"
+  value       = [for sa in azurerm_storage_account.main : sa.primary_connection_string]
+  sensitive   = true
 }
 
 output "containers" {
-  description = "Map of created container names"
-  value       = { for k, v in azurerm_storage_container.containers : k => v.name }
+  description = "All containers created, grouped by storage account index"
+  value = {
+    for idx in range(var.storage_account_count) :
+    azurerm_storage_account.main[idx].name => [
+      for k, v in azurerm_storage_container.containers :
+      v.name if startswith(k, "${idx}-")
+    ]
+  }
 }
 
 output "resource_group_name" {

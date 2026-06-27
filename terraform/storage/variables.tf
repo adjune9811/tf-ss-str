@@ -1,3 +1,14 @@
+variable "storage_account_count" {
+  description = "How many storage accounts to create. Increase to add, decrease to remove."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.storage_account_count >= 1 && var.storage_account_count <= 10
+    error_message = "storage_account_count must be between 1 and 10"
+  }
+}
+
 variable "project" {
   description = "Project name — used in resource names and tags"
   type        = string
