@@ -1,0 +1,49 @@
+# TEMPLATE: reusable build steps
+# Call this from any pipeline with:
+#   - template: templates/steps-build.yml
+#     parameters:
+#       nodeVersion: '20'
+#       runTests: true
+
+# CONCEPT: parameters
+# Parameters are the inputs to a template — like function arguments.
+# Unlike variables, parameters are type-checked and have defaults.
+parameters:
+  - name: nodeVersion
+    type: string
+    default: '20'
+
+  - name: runTests
+    type: boolean
+    default: true
+
+  - name: buildCommand
+    type: string
+    default: 'echo "No build command — static site"'
+
+  - name: artifactName
+    type: string
+    default: 'website'
+
+steps:
+  # ${{ }} syntax is template expression — evaluated at PARSE TIME
+  # This means conditionals here remove the step entirely, not just skip it
+  - task: NodeTool@0
+    displayName: 'Install Node ${{ parameters.nodeVersion }}'
+    inputs:
+      versionSpec: '${{ parameters.nodeVersion }}'
+
+  - script: ${{ parameters.buildCommand }}
+    displayName: 'Build'
+
+  # ${{ if }} — template-time conditional
+  # The step is completely absent from the pipeline if condition is false
+  - ${{ if eq(parameters.runTests, true) }}:
+    - script: echo "Running tests..."
+      displayName: 'Run tests'
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish artifact: ${{ parameters.artifactName }}'
+    inputs:
+      pathToPublish: '$(Build.ArtifactStagingDirectory)'
+      artifactName: '${{ parameters.artifactName }}'

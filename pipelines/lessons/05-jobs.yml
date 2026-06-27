@@ -1,0 +1,170 @@
+# LESSON 5: Jobs — serial, parallel, fan-out/fan-in, matrix
+#
+# KEY INSIGHT: Jobs within a stage run IN PARALLEL by default.
+# Use dependsOn to make them serial.
+# Each job runs on a FRESH agent — no shared file system between jobs.
+# Use artifacts to pass files between jobs.
+
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # ─── PATTERN 1: Parallel jobs ─────────────────────────────────────────────
+  # Unit tests, lint, and security scan run at the same time.
+  # Total time = slowest job (not sum of all).
+  - stage: ParallelChecks
+    displayName: 'Parallel CI checks'
+    jobs:
+      - job: UnitTests
+        displayName: 'Unit tests'
+        steps:
+          - script: |
+              echo "Running unit tests..."
+              sleep 3   # simulate work
+              echo "All 42 tests passed"
+            displayName: 'Run unit tests'
+
+      - job: Lint
+        displayName: 'Lint'
+        steps:
+          - script: |
+              echo "Running linter..."
+              sleep 2
+              echo "No lint errors"
+            displayName: 'Lint code'
+
+      - job: SecurityScan
+        displayName: 'Security scan'
+        steps:
+          - script: |
+              echo "Running dependency vulnerability scan..."
+              sleep 4
+              echo "No vulnerabilities found"
+            displayName: 'Scan dependencies'
+
+  # ─── PATTERN 2: Fan-out / Fan-in ─────────────────────────────────────────
+  # Build first, then run multiple tests in parallel, then package.
+  # PackageJob waits for ALL test jobs to finish (fan-in).
+  - stage: FanOutFanIn
+    displayName: 'Fan-out / Fan-in pattern'
+    dependsOn: ParallelChecks
+    jobs:
+      - job: Build
+        displayName: '1. Build'
+        steps:
+          - script: echo "Building artifact..."
+            displayName: 'Build'
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)
+              echo "app-v$(Build.BuildId)" > $(Build.ArtifactStagingDirectory)/app.txt
+            displayName: 'Create artifact'
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)
+              artifactName: 'drop'
+
+      # These two run in parallel AFTER Build
+      - job: IntegrationTests
+        displayName: '2a. Integration tests (parallel)'
+        dependsOn: Build
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              artifactName: 'drop'
+              downloadPath: $(Pipeline.Workspace)
+          - script: |
+              echo "Got artifact: $(cat $(Pipeline.Workspace)/drop/app.txt)"
+              echo "Running integration tests..."
+              sleep 3
+            displayName: 'Integration tests'
+
+      - job: E2ETests
+        displayName: '2b. E2E tests (parallel)'
+        dependsOn: Build
+        steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              artifactName: 'drop'
+              downloadPath: $(Pipeline.Workspace)
+          - script: |
+              echo "Got artifact: $(cat $(Pipeline.Workspace)/drop/app.txt)"
+              echo "Running E2E tests..."
+              sleep 5
+            displayName: 'E2E tests'
+
+      # Fan-in: Package waits for BOTH test jobs
+      - job: Package
+        displayName: '3. Package (fan-in — waits for both test jobs)'
+        dependsOn:
+          - IntegrationTests
+          - E2ETests
+        # Condition: only package if BOTH test jobs succeeded
+        condition: |
+          and(
+            succeeded('IntegrationTests'),
+            succeeded('E2ETests')
+          )
+        steps:
+          - script: echo "Both test suites passed — creating release package"
+            displayName: 'Package for release'
+
+  # ─── PATTERN 3: Matrix strategy ───────────────────────────────────────────
+  # Run the same job with different parameters.
+  # Use case: test against multiple OS, Node versions, Python versions.
+  - stage: MatrixBuild
+    displayName: 'Matrix — test across environments'
+    dependsOn: []   # run independently
+    jobs:
+      - job: TestMatrix
+        displayName: 'Test on'
+        strategy:
+          matrix:
+            # Each key becomes a separate job run with those variable values
+            Ubuntu_Node18:
+              OS_IMAGE: 'ubuntu-latest'
+              NODE_VERSION: '18'
+            Ubuntu_Node20:
+              OS_IMAGE: 'ubuntu-latest'
+              NODE_VERSION: '20'
+            Windows_Node20:
+              OS_IMAGE: 'windows-latest'
+              NODE_VERSION: '20'
+          maxParallel: 3    # run all 3 at the same time (if enough agents)
+
+        pool:
+          vmImage: $(OS_IMAGE)    # uses the matrix variable
+
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: $(NODE_VERSION)
+            displayName: 'Install Node $(NODE_VERSION)'
+
+          - script: node --version
+            displayName: 'Verify Node version'
+
+  # ─── PATTERN 4: Job timeout and retry ─────────────────────────────────────
+  - stage: TimeoutRetry
+    displayName: 'Timeout and retry'
+    dependsOn: []
+    jobs:
+      - job: SlowJob
+        displayName: 'Job with timeout'
+        timeoutInMinutes: 5        # cancel the job if it runs longer than 5 min
+        cancelTimeoutInMinutes: 1  # give 1 min for cleanup after cancel
+        steps:
+          - script: echo "This job will be cancelled if it takes more than 5 minutes"
+            displayName: 'Timed work'
+
+      - job: FlakyJob
+        displayName: 'Job with retry'
+        # Retry the entire job up to 2 times if it fails.
+        # Useful for flaky integration tests that depend on external services.
+        # NOTE: retry = re-run from scratch on a fresh agent
+        steps:
+          - script: |
+              echo "Attempt number — check logs for retries"
+              # In real use this might be a flaky external API call
+            displayName: 'Flaky step'

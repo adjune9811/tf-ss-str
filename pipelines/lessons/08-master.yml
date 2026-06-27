@@ -1,0 +1,206 @@
+# LESSON 8: Master pipeline — every concept combined
+#
+# This is a production-quality pipeline for our static site.
+# Concepts used: trigger, pr, variables, stages, parallel jobs,
+# conditions, artifacts, templates, matrix, deployment jobs, environments.
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [app/**, pipelines/**]
+
+pr:
+  branches:
+    include: [main]
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - name: APP_NAME
+    value: 'azure-devops-demo'
+  - name: BUILD_TAG
+    value: '$(Build.BuildId)'
+  - name: IS_MAIN
+    value: $[ eq(variables['Build.SourceBranch'], 'refs/heads/main') ]
+  - name: IS_PR
+    value: $[ eq(variables['Build.Reason'], 'PullRequest') ]
+
+stages:
+  # ══════════════════════════════════════════════════════════
+  # STAGE 1: VALIDATE — parallel quality checks
+  # Runs on every push AND every PR
+  # ══════════════════════════════════════════════════════════
+  - stage: Validate
+    displayName: 'Validate'
+    jobs:
+      - job: HTMLLint
+        displayName: 'HTML validation'
+        steps:
+          - checkout: self
+          - script: |
+              sudo apt-get install -y -q tidy
+              tidy -errors -quiet app/index.html && echo "HTML is valid" || echo "HTML has warnings"
+            displayName: 'Validate HTML'
+
+      - job: FileChecks
+        displayName: 'File checks'
+        steps:
+          - checkout: self
+          - script: |
+              echo "=== Checking required files exist ==="
+              [ -f app/index.html ] && echo "✓ index.html" || (echo "✗ index.html missing"; exit 1)
+              [ -f app/style.css ]  && echo "✓ style.css"  || (echo "✗ style.css missing"; exit 1)
+              echo "All required files present"
+            displayName: 'Check required files'
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 2: BUILD — package the site and publish artifact
+  # Runs after Validate, on all branches
+  # ══════════════════════════════════════════════════════════
+  - stage: Build
+    displayName: 'Build'
+    dependsOn: Validate
+    condition: succeeded('Validate')
+    jobs:
+      - job: Package
+        displayName: 'Package site'
+        steps:
+          - checkout: self
+
+          - script: |
+              BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              BRANCH="$(Build.SourceBranchName)"
+              BUILD_ID="$(Build.BuildId)"
+
+              sed -i "s/BUILD_ID/$BUILD_ID/g"         app/index.html
+              sed -i "s/DEPLOY_TIMESTAMP/$BUILD_TIME/g" app/index.html
+              sed -i "s/AZURE_ENV/$BRANCH/g"           app/index.html
+
+              echo "Injected: build=$BUILD_ID branch=$BRANCH time=$BUILD_TIME"
+            displayName: 'Inject build metadata'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish site artifact'
+            inputs:
+              pathToPublish: 'app'
+              artifactName: 'website-$(BUILD_TAG)'
+              publishLocation: 'Container'
+
+          # Publish a simple build summary
+          - script: |
+              echo "## Build Summary" > summary.md
+              echo "- **Build:** $(Build.BuildId)" >> summary.md
+              echo "- **Branch:** $(Build.SourceBranchName)" >> summary.md
+              echo "- **Commit:** $(Build.SourceVersion)" >> summary.md
+              echo "- **Triggered by:** $(Build.RequestedFor)" >> summary.md
+              cat summary.md
+            displayName: 'Build summary'
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 3: DEPLOY DEV
+  # Only runs on main branch (not PRs)
+  # ══════════════════════════════════════════════════════════
+  - stage: DeployDev
+    displayName: 'Deploy → Dev'
+    dependsOn: Build
+    condition: |
+      and(
+        succeeded('Build'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+    variables:
+      DEPLOY_ENV: 'dev'
+      VM_IP: $(DEV_VM_IP)       # from Variable Group: vm-deploy-secrets
+    jobs:
+      - deployment: DeployDev
+        displayName: 'Deploy to dev-vm'
+        environment: 'dev-vm'   # no approval gate on dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    artifactName: 'website-$(BUILD_TAG)'
+                    downloadPath: $(Pipeline.Workspace)
+
+                - script: |
+                    echo "Deploying build $(BUILD_TAG) to DEV at $(VM_IP)"
+                    # Real deploy: scp + ssh reload nginx
+                  displayName: 'Deploy to dev'
+
+                - script: |
+                    HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://$(VM_IP) 2>/dev/null || echo "000")
+                    echo "HTTP status: $HTTP"
+                    [ "$HTTP" = "200" ] && echo "Dev deploy verified" || echo "Note: VM not available in this demo"
+                  displayName: 'Smoke test dev'
+                  continueOnError: true
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 4: DEPLOY PROD
+  # Only runs after Dev succeeds. Has a manual approval gate.
+  # ══════════════════════════════════════════════════════════
+  - stage: DeployProd
+    displayName: 'Deploy → Prod'
+    dependsOn: DeployDev
+    condition: succeeded('DeployDev')
+    variables:
+      DEPLOY_ENV: 'prod'
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Deploy to prod-vm'
+        # CONCEPT: environment with approval
+        # Go to Pipelines > Environments > prod-vm > Approvals and checks
+        # Add an "Approvals" check — pipeline pauses here until someone approves.
+        environment: 'prod-vm'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  inputs:
+                    artifactName: 'website-$(BUILD_TAG)'
+                    downloadPath: $(Pipeline.Workspace)
+
+                - script: |
+                    echo "PROD deploy approved — deploying build $(BUILD_TAG)"
+                  displayName: 'Deploy to prod'
+
+                - script: |
+                    echo "Post-deploy: verifying prod..."
+                    echo "Post-deploy: sending Slack notification..."
+                  displayName: 'Post-deploy tasks'
+
+  # ══════════════════════════════════════════════════════════
+  # STAGE 5: NOTIFY (always runs — success or failure)
+  # ══════════════════════════════════════════════════════════
+  - stage: Notify
+    displayName: 'Notify'
+    dependsOn:
+      - Validate
+      - Build
+      - DeployDev
+      - DeployProd
+    condition: always()   # run even if earlier stages failed
+    jobs:
+      - job: SendNotification
+        steps:
+          - script: |
+              # Check the result of the deploy stages
+              DEV_RESULT="$(dependencies.DeployDev.result)"
+              PROD_RESULT="$(dependencies.DeployProd.result)"
+
+              echo "Pipeline complete"
+              echo "  Validate: $(dependencies.Validate.result)"
+              echo "  Build:    $(dependencies.Build.result)"
+              echo "  Dev:      $DEV_RESULT"
+              echo "  Prod:     $PROD_RESULT"
+
+              # In real use: post to Slack/Teams via webhook
+              # curl -X POST https://hooks.slack.com/... -d "{...}"
+            displayName: 'Pipeline result summary'
+            env:
+              VALIDATE_RESULT: $(dependencies.Validate.result)

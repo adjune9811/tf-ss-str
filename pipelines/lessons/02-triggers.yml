@@ -1,0 +1,102 @@
+# LESSON 2: All trigger types
+# A pipeline can start from 4 different events:
+#   1. push trigger   — someone pushes code
+#   2. pr trigger     — someone opens or updates a Pull Request
+#   3. schedule       — cron-like time-based trigger
+#   4. manual         — someone clicks Run in Azure DevOps UI
+
+# ─── 1. PUSH TRIGGER ──────────────────────────────────────────────────────────
+# Runs when code is pushed to matching branches / paths.
+trigger:
+  branches:
+    include:
+      - main
+      - release/*      # wildcard — matches release/1.0, release/2.0, etc.
+    exclude:
+      - feature/experimental   # never trigger on this branch
+  paths:
+    include:
+      - app/**         # only trigger if files under app/ changed
+      - pipelines/**
+    exclude:
+      - '**/*.md'      # don't trigger for markdown-only changes (docs)
+  tags:
+    include:
+      - v*             # also trigger when a version tag like v1.2.3 is pushed
+
+# ─── 2. PR TRIGGER ────────────────────────────────────────────────────────────
+# Runs CI checks when a Pull Request targets these branches.
+# NOTE: Deploy stages should be conditioned OUT on PRs — you validate, not deploy.
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - app/**         # only run PR check if app code changed, not docs
+
+# ─── 3. SCHEDULED TRIGGER ─────────────────────────────────────────────────────
+# Runs on a cron schedule regardless of code changes.
+# Use case: nightly full test suite, weekly dependency audits.
+schedules:
+  - cron: '0 2 * * 1-5'       # 2am UTC, Monday–Friday
+    displayName: 'Nightly build'
+    branches:
+      include:
+        - main
+    always: true               # run even if no new commits since last run
+
+# ─── DISABLING TRIGGERS ───────────────────────────────────────────────────────
+# To disable CI trigger (run only manually):
+# trigger: none
+#
+# To disable PR trigger:
+# pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+  # CONCEPT: predefined variables
+  # Azure DevOps injects dozens of variables automatically.
+  # These are the most useful ones to know.
+  - script: |
+      echo "=== Trigger Information ==="
+      echo "What triggered this run:"
+      echo "  Build.Reason          = $(Build.Reason)"
+      # Values: IndividualCI (push), PullRequest, Schedule, Manual, BatchedCI
+
+      echo ""
+      echo "=== Branch / Commit Info ==="
+      echo "  Build.SourceBranch    = $(Build.SourceBranch)"
+      # Full ref: refs/heads/main  or  refs/pull/12/merge  or  refs/tags/v1.0
+
+      echo "  Build.SourceBranchName = $(Build.SourceBranchName)"
+      # Short name: main  (strips refs/heads/)
+
+      echo "  Build.SourceVersion   = $(Build.SourceVersion)"
+      # The commit SHA that triggered this run
+
+      echo ""
+      echo "=== Build Identity ==="
+      echo "  Build.BuildId         = $(Build.BuildId)"
+      # Integer, increments per pipeline run — good for image tags
+
+      echo "  Build.BuildNumber     = $(Build.BuildNumber)"
+      # Formatted: defaults to $(Date:yyyyMMdd).$(Rev:r) — e.g. 20260627.3
+
+      echo "  System.TeamProject    = $(System.TeamProject)"
+      echo "  Build.Repository.Name = $(Build.Repository.Name)"
+
+      echo ""
+      echo "=== Agent Info ==="
+      echo "  Agent.OS              = $(Agent.OS)"
+      echo "  Agent.OSArchitecture  = $(Agent.OSArchitecture)"
+      echo "  Agent.WorkFolder      = $(Agent.WorkFolder)"
+    displayName: 'Show all predefined variables'
+
+  # CONCEPT: condition on trigger type
+  # Only do extra work on scheduled runs — e.g. full regression test suite
+  - script: echo "Running extended tests because this is a scheduled run"
+    displayName: 'Extended tests (scheduled only)'
+    condition: eq(variables['Build.Reason'], 'Schedule')
