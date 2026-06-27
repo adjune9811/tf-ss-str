@@ -1,7 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Azure Pipeline — Deploy Terraform Storage
-# Runs on a self-hosted Windows agent (your PC)
-# Terraform must be installed on your PC: https://developer.hashicorp.com/terraform/install
+# Runs on Microsoft-hosted Ubuntu (1800 free mins/month for private projects)
 # ─────────────────────────────────────────────────────────────────────────────
 
 trigger:
@@ -23,11 +22,11 @@ pr:
       - "*.tf"
       - terraform.tfvars
 
-# Self-hosted agent running on your Windows PC — free, no parallel job needed
 pool:
-  name: "MyPC"
+  vmImage: "ubuntu-latest"
 
 variables:
+  TF_VERSION: "1.7.5"
   WORKING_DIR: "$(System.DefaultWorkingDirectory)"
   SERVICE_CONNECTION: "azure-service-connection"
 
@@ -45,28 +44,22 @@ stages:
         steps:
           - checkout: self
 
-          - powershell: |
-              Write-Host "=== Terraform version ==="
+          - script: |
+              wget -q https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip
+              unzip -q terraform_$(TF_VERSION)_linux_amd64.zip
+              sudo mv terraform /usr/local/bin/
               terraform version
-            workingDirectory: $(WORKING_DIR)
-            displayName: "Check Terraform installed"
+            displayName: "Install Terraform"
 
-          - powershell: |
-              Write-Host "=== Checking formatting ==="
-              terraform fmt -check -diff
-              if ($LASTEXITCODE -ne 0) { exit 1 }
+          - script: terraform fmt -check -diff
             workingDirectory: $(WORKING_DIR)
             displayName: "terraform fmt -check"
 
-          - powershell: |
-              Write-Host "=== Initializing providers ==="
-              terraform init -backend=false
+          - script: terraform init -backend=false
             workingDirectory: $(WORKING_DIR)
-            displayName: "terraform init (no backend)"
+            displayName: "terraform init"
 
-          - powershell: |
-              Write-Host "=== Validating ==="
-              terraform validate
+          - script: terraform validate
             workingDirectory: $(WORKING_DIR)
             displayName: "terraform validate"
 
@@ -89,31 +82,35 @@ stages:
         steps:
           - checkout: self
 
+          - script: |
+              wget -q https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip
+              unzip -q terraform_$(TF_VERSION)_linux_amd64.zip
+              sudo mv terraform /usr/local/bin/
+              terraform version
+            displayName: "Install Terraform"
+
           - task: AzureCLI@2
             displayName: "terraform init + plan"
             inputs:
               azureSubscription: $(SERVICE_CONNECTION)
-              scriptType: "pscore"
+              scriptType: "bash"
               scriptLocation: "inlineScript"
               workingDirectory: $(WORKING_DIR)
               addSpnToEnvironment: true
               inlineScript: |
-                $env:ARM_CLIENT_ID       = $env:servicePrincipalId
-                $env:ARM_CLIENT_SECRET   = $env:servicePrincipalKey
-                $env:ARM_TENANT_ID       = $env:tenantId
-                $env:ARM_SUBSCRIPTION_ID = $(az account show --query id -o tsv)
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-                Write-Host "=== terraform init ==="
                 terraform init -backend=false
 
-                Write-Host "=== terraform plan ==="
-                terraform plan `
-                  -var-file="terraform.tfvars" `
-                  -var="subscription_id=$env:ARM_SUBSCRIPTION_ID" `
-                  -out="$(WORKING_DIR)\tfplan"
+                terraform plan \
+                  -var-file="terraform.tfvars" \
+                  -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+                  -out="$(WORKING_DIR)/tfplan"
 
-                Write-Host "=== Plan summary ==="
-                terraform show -no-color "$(WORKING_DIR)\tfplan"
+                terraform show -no-color $(WORKING_DIR)/tfplan
 
           - task: PublishBuildArtifacts@1
             displayName: "Publish plan artifact"
@@ -140,6 +137,13 @@ stages:
               steps:
                 - checkout: self
 
+                - script: |
+                    wget -q https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip
+                    unzip -q terraform_$(TF_VERSION)_linux_amd64.zip
+                    sudo mv terraform /usr/local/bin/
+                    terraform version
+                  displayName: "Install Terraform"
+
                 - task: DownloadBuildArtifacts@1
                   displayName: "Download plan artifact"
                   inputs:
@@ -150,21 +154,19 @@ stages:
                   displayName: "terraform init + apply"
                   inputs:
                     azureSubscription: $(SERVICE_CONNECTION)
-                    scriptType: "pscore"
+                    scriptType: "bash"
                     scriptLocation: "inlineScript"
                     workingDirectory: $(WORKING_DIR)
                     addSpnToEnvironment: true
                     inlineScript: |
-                      $env:ARM_CLIENT_ID       = $env:servicePrincipalId
-                      $env:ARM_CLIENT_SECRET   = $env:servicePrincipalKey
-                      $env:ARM_TENANT_ID       = $env:tenantId
-                      $env:ARM_SUBSCRIPTION_ID = $(az account show --query id -o tsv)
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_CLIENT_SECRET=$servicePrincipalKey
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-                      Write-Host "=== terraform init ==="
                       terraform init -backend=false
 
-                      Write-Host "=== terraform apply ==="
-                      terraform apply -auto-approve "$(WORKING_DIR)\tfplan\tfplan"
+                      terraform apply -auto-approve "$(WORKING_DIR)/tfplan/tfplan"
 
-                      Write-Host "=== Resources deployed ==="
+                      echo "=== Resources deployed ==="
                       terraform state list
