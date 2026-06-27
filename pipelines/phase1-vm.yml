@@ -1,0 +1,232 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1 PIPELINE — CI + Deploy to Azure VM
+#
+# Flow:  code push → Build (lint + package) → Deploy to VM via SSH
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CONCEPT: trigger
+# Defines what events start the pipeline automatically.
+# 'main' branch push = full CI + deploy.
+# PRs to main = only CI (no deploy) — configured via branch policy in Azure Repos.
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - app/**           # only run if files under /app changed
+      - pipelines/**     # or if the pipeline itself changed
+
+# CONCEPT: pr trigger
+# Run CI-only on pull requests (no deploy stage).
+pr:
+  branches:
+    include:
+      - main
+
+# CONCEPT: pool
+# The build agent. 'ubuntu-latest' = Microsoft-hosted Linux agent (free tier: 1 parallel job).
+# Microsoft manages it — no infra to run. Good for most cases.
+pool:
+  vmImage: 'ubuntu-latest'
+
+# CONCEPT: variables
+# Reusable values. 'group' links to a Variable Group defined in Azure DevOps Library
+# where you store secrets (VM IP, SSH key, etc.) so they're not in code.
+variables:
+  - group: vm-deploy-secrets    # Contains: VM_IP, ADMIN_USERNAME
+  - name: SITE_DIR
+    value: 'app'                # Local folder with our static site files
+  - name: REMOTE_DIR
+    value: '/var/www/html'      # Where Nginx serves files on the VM
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1: BUILD
+# Lint HTML and package the site into a pipeline artifact.
+# ─────────────────────────────────────────────────────────────────────────────
+stages:
+  - stage: Build
+    displayName: 'Build & Validate'
+
+    jobs:
+      - job: ValidateAndPackage
+        displayName: 'Lint HTML + Package Artifact'
+
+        steps:
+          # CONCEPT: checkout
+          # By default pipelines check out the triggering repo. Explicit here for clarity.
+          - checkout: self
+            displayName: 'Checkout source code'
+
+          # CONCEPT: script step
+          # Run arbitrary shell commands. 'displayName' shows in the pipeline UI log.
+          - script: |
+              echo "=== Files in app/ ==="
+              ls -la $(SITE_DIR)/
+              echo "=== Validating HTML ==="
+              # Install html-tidy for basic HTML validation
+              sudo apt-get install -y tidy
+              tidy -errors -quiet $(SITE_DIR)/index.html || true
+            displayName: 'Validate HTML'
+
+          # CONCEPT: script — inject build metadata into the HTML
+          # The pipeline replaces placeholder tokens with real values.
+          # This is how you see "Build #123" on the deployed page.
+          - script: |
+              BUILD_ID="$(Build.BuildId)"
+              TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+              ENV_NAME="$(Build.SourceBranchName)"
+
+              sed -i "s/BUILD_ID/$BUILD_ID/g"     $(SITE_DIR)/index.html
+              sed -i "s/DEPLOY_TIMESTAMP/$TIMESTAMP/g" $(SITE_DIR)/index.html
+              sed -i "s/AZURE_ENV/$ENV_NAME/g"    $(SITE_DIR)/index.html
+
+              echo "Injected: build=$BUILD_ID, env=$ENV_NAME, time=$TIMESTAMP"
+            displayName: 'Inject build metadata into HTML'
+
+          # CONCEPT: PublishBuildArtifacts task
+          # Saves files from the agent's workspace so later stages can download them.
+          # This is how you pass the built app from Build stage → Deploy stage.
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish site as pipeline artifact'
+            inputs:
+              pathToPublish: '$(SITE_DIR)'     # folder to publish
+              artifactName: 'website'          # name — used in Download step below
+              publishLocation: 'Container'     # store in Azure DevOps (not a file share)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2: PROVISION (Terraform)
+# Create or update the Azure VM. Runs only on main branch, not on PRs.
+# ─────────────────────────────────────────────────────────────────────────────
+  - stage: Provision
+    displayName: 'Provision Infrastructure (Terraform)'
+    dependsOn: Build                            # only run if Build succeeded
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      - job: TerraformApply
+        displayName: 'Terraform Init + Plan + Apply'
+
+        steps:
+          - checkout: self
+
+          # CONCEPT: TerraformInstaller task
+          # Installs Terraform CLI on the agent at a specific version.
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform 1.7.x'
+            inputs:
+              terraformVersion: '1.7.5'
+
+          # CONCEPT: TerraformTaskV4 — init
+          # Downloads providers and configures the Azure backend.
+          # ARM_* env vars come from the pipeline service connection (Service Principal).
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/vm'
+              backendServiceArm: 'azure-service-connection'  # Service connection name in Azure DevOps
+              backendAzureRmResourceGroupName: 'rg-terraform-state'
+              backendAzureRmStorageAccountName: 'stterraformstate001'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'vm/terraform.tfstate'
+
+          # CONCEPT: TerraformTaskV4 — plan
+          # Shows what changes Terraform will make. Output saved for review.
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/vm'
+              environmentServiceNameAzureRM: 'azure-service-connection'
+              commandOptions: '-out=tfplan'
+
+          # CONCEPT: TerraformTaskV4 — apply
+          # Applies the plan. Creates/updates Azure resources.
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Apply'
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/vm'
+              environmentServiceNameAzureRM: 'azure-service-connection'
+              commandOptions: '-auto-approve tfplan'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3: DEPLOY
+# Copy the built site to the VM via SSH/SCP.
+# Only runs on main branch after Build + Provision succeed.
+# ─────────────────────────────────────────────────────────────────────────────
+  - stage: Deploy
+    displayName: 'Deploy to Azure VM'
+    dependsOn:
+      - Build
+      - Provision
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      # CONCEPT: deployment job
+      # A special job type for deployments. Tracks deployment history in Azure DevOps,
+      # supports environments, approvals, and rollback.
+      - deployment: DeployToVM
+        displayName: 'Copy files to VM via SSH'
+        # CONCEPT: environment
+        # Named target (dev, staging, prod). Configure approvals here in Azure DevOps UI:
+        #   Pipelines > Environments > production > Approvals and checks
+        environment: 'dev-vm'
+
+        strategy:
+          # CONCEPT: runOnce strategy
+          # Simplest strategy — runs the deploy steps once.
+          # Other options: rolling (batches), canary (percentage traffic split)
+          runOnce:
+            deploy:
+              steps:
+                # CONCEPT: DownloadBuildArtifacts task
+                # Downloads the artifact published in the Build stage.
+                # Now available at $(Pipeline.Workspace)/website/
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Download website artifact'
+                  inputs:
+                    artifactName: 'website'
+                    downloadPath: '$(Pipeline.Workspace)'
+
+                # CONCEPT: SSH key setup
+                # The SSH private key is stored as a secret file in Azure DevOps Library.
+                # This task writes it to disk temporarily so SSH/SCP commands work.
+                - task: InstallSSHKey@0
+                  displayName: 'Install SSH private key'
+                  inputs:
+                    knownHostsEntry: '$(VM_KNOWN_HOST)'   # from Variable Group
+                    sshPublicKey: '$(SSH_PUBLIC_KEY)'     # from Variable Group
+                    sshKeySecureFile: 'vm_ssh_key'        # secure file in Library
+
+                # CONCEPT: script — deploy via SCP
+                # Copy built site files from the agent to the VM.
+                - script: |
+                    echo "Deploying to $(VM_IP)..."
+                    scp -o StrictHostKeyChecking=no -r \
+                      $(Pipeline.Workspace)/website/* \
+                      $(ADMIN_USERNAME)@$(VM_IP):$(REMOTE_DIR)/
+
+                    echo "Reloading Nginx..."
+                    ssh -o StrictHostKeyChecking=no \
+                      $(ADMIN_USERNAME)@$(VM_IP) \
+                      "sudo systemctl reload nginx"
+
+                    echo "Deploy complete! Site at http://$(VM_IP)"
+                  displayName: 'SCP files to VM + reload Nginx'
+
+                # CONCEPT: post-deploy smoke test
+                # Verify the deploy worked by checking the HTTP response.
+                - script: |
+                    echo "Smoke testing http://$(VM_IP)..."
+                    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$(VM_IP))
+                    if [ "$HTTP_STATUS" != "200" ]; then
+                      echo "ERROR: Got HTTP $HTTP_STATUS — deploy may have failed!"
+                      exit 1
+                    fi
+                    echo "SUCCESS: Site is responding with HTTP 200"
+                  displayName: 'Smoke test — verify HTTP 200'

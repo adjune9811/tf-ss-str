@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Azure DevOps Demo App</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="badge">Deployed via Azure DevOps Pipelines</div>
+    <h1>Hello from Azure!</h1>
+    <p class="subtitle">This page was built and deployed automatically by a CI/CD pipeline.</p>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card">
+        <h2>Build</h2>
+        <p>Azure Pipelines compiled and validated this site on every commit.</p>
+      </div>
+      <div class="card">
+        <h2>Test</h2>
+        <p>HTML linting and link checks ran automatically before deploy.</p>
+      </div>
+      <div class="card">
+        <h2>Deploy</h2>
+        <p>Pushed to Azure VM (Phase 1) and AKS (Phase 2) with zero downtime.</p>
+      </div>
+    </section>
+
+    <section class="info">
+      <p>Environment: <strong id="env">AZURE_ENV</strong></p>
+      <p>Build ID: <strong id="build">BUILD_ID</strong></p>
+      <p>Deployed at: <strong id="ts">DEPLOY_TIMESTAMP</strong></p>
+    </section>
+  </main>
+
+  <footer>
+    <p>Powered by Azure DevOps &bull; Terraform &bull; Nginx</p>
+  </footer>
+</body>
+</html>
